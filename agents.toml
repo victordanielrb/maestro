@@ -1,0 +1,34 @@
+[[agents]]
+name               = "claude"
+command            = "claude"
+args               = ["--dangerously-skip-permissions"]
+plan_mode          = "Inline"
+plan_args          = []
+plan_prefix        = ""
+plan_trigger       = "Do you want to proceed"
+plan_accept        = "yes"
+plan_reject        = "no"
+input_timeout_secs = 300
+
+[[agents]]
+name               = "aider"
+command            = "aider"
+args               = ["--yes-always"]
+plan_mode          = "None"
+plan_args          = []
+plan_trigger       = ""
+plan_accept        = ""
+plan_reject        = ""
+input_timeout_secs = 0
+
+# Agente de teste local — útil para validar o motor sem agente real
+[[agents]]
+name               = "echo-test"
+command            = "bash"
+args               = ["-c", "printf 'Analisando código...\\nEncontrei 3 arquivos relevantes.\\nPlano proposto:\\n  + adicionar feature X\\n  ~ modificar Y\\nDo you want to proceed? [yes/no]\\n'; read ans; if [ \"$ans\" = \"yes\" ]; then printf 'Executando mudanças...\\nConcluído!\\n'; fi"]
+plan_mode          = "None"
+plan_args          = []
+plan_trigger       = "Do you want to proceed"
+plan_accept        = "yes"
+plan_reject        = "no"
+input_timeout_secs = 0

@@ -1,0 +1,27 @@
+[package]
+name = "agent-orchestrator"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+ratatui          = "0.30"
+crossterm        = "0.29"
+# ratatui-image reintroduzida na Fase 3 (screenshots). Requer: sudo apt install libchafa-dev
+# ratatui-image = { version = "11", features = ["crossterm"] }
+tokio            = { version = "1", features = ["full"] }
+serde            = { version = "1", features = ["derive"] }
+toml             = "1.1"
+uuid             = { version = "1", features = ["v4", "serde"] }
+regex            = "1"
+anyhow           = "1"
+chrono           = { version = "0.4", features = ["serde"] }
+tracing          = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+notify           = "6"
+
+[profile.dev]
+opt-level = 1
