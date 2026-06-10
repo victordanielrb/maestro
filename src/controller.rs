@@ -203,7 +203,7 @@ pub async fn run(
                 line_count += 1;
                 // Log first lines + every 50th to debug without flooding
                 if line_count <= 10 || line_count % 50 == 0 {
-                    debug(&event_tx, format!("[stdout:{}] {}", line_count, &line[..line.len().min(100)]));
+                    debug(&event_tx, format!("[stdout:{}] {}", line_count, line.chars().take(100).collect::<String>().as_str()));
                 }
 
                 // Skip echo of our own writes (PTY echoes stdin back on stdout)
@@ -219,7 +219,7 @@ pub async fn run(
                         debug(&event_tx, format!(
                             "[trigger] MATCHED line {}: {:?}",
                             line_count,
-                            &line[..line.len().min(80)]
+                            line.chars().take(80).collect::<String>().as_str()
                         ));
                         send_status(&event_tx, task_id, TaskStatus::WaitingApproval);
 
