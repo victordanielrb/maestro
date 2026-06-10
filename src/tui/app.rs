@@ -87,7 +87,7 @@ impl AppState {
             AppEvent::LogLine { task_id, line } => {
                 let task_name = self.tasks.iter().find(|t| t.id == task_id)
                     .map(|t| t.name.clone()).unwrap_or_default();
-                self.push_debug(format!("[log:{}] {}", task_name, &line[..line.len().min(120)]));
+                self.push_debug(format!("[log:{}] {}", task_name, line));
                 if let Some(task) = self.find_task_mut(task_id) {
                     task.append_agent_line(&line);
                 }
@@ -126,14 +126,19 @@ impl AppState {
     }
 
     fn push_debug(&mut self, msg: String) {
+        // Write to file so the user can `tail -f .orchestrator/debug.log` and copy text
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(".orchestrator/debug.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", msg);
+        }
+
         self.debug_logs.push(msg);
-        // Keep last 2000 lines to avoid unbounded growth
         if self.debug_logs.len() > 2000 {
             self.debug_logs.drain(..200);
-        }
-        // Auto-scroll to bottom when not manually scrolled
-        if self.debug_scroll == 0 {
-            self.debug_scroll = 0;
         }
     }
 

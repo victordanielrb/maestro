@@ -349,7 +349,10 @@ fn render_debug_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     f.render_widget(Clear, area);
 
     let count = state.debug_logs.len();
-    let title = format!(" Debug Log ({} lines) — [?/q/Esc] close  [j/k] scroll  [g/G] top/bottom ", count);
+    let title = format!(
+        " Debug Log ({} entries) — [?/q/Esc] close  [j/k] scroll  [g/G] top/bottom  tail: .orchestrator/debug.log ",
+        count
+    );
 
     let block = Block::default()
         .title(title)
@@ -359,8 +362,44 @@ fn render_debug_overlay(f: &mut Frame, state: &AppState, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let width = inner.width as usize;
+
+    // Expand each log entry into wrapped display lines, keeping color per entry
+    let mut display_lines: Vec<Line> = Vec::new();
+    for msg in &state.debug_logs {
+        let color = debug_line_color(msg);
+        let style = Style::default().fg(color);
+        // Word-wrap at inner width
+        let mut remaining = msg.as_str();
+        let mut first = true;
+        while !remaining.is_empty() {
+            let take = remaining
+                .char_indices()
+                .scan(0usize, |col, (i, c)| {
+                    *col += 1;
+                    if *col > width { None } else { Some(i) }
+                })
+                .last()
+                .map(|i| {
+                    // advance by one char
+                    let mut end = i;
+                    let c = remaining[i..].chars().next().unwrap();
+                    end += c.len_utf8();
+                    end
+                })
+                .unwrap_or(remaining.len());
+            let prefix = if first { "" } else { "  " };
+            display_lines.push(Line::from(Span::styled(
+                format!("{}{}", prefix, &remaining[..take]),
+                style,
+            )));
+            remaining = &remaining[take..];
+            first = false;
+        }
+    }
+
+    let total = display_lines.len();
     let visible = inner.height as usize;
-    let total = count;
 
     let start = if total > visible {
         let max_scroll = total - visible;
@@ -370,31 +409,24 @@ fn render_debug_overlay(f: &mut Frame, state: &AppState, area: Rect) {
         0
     };
 
-    let lines: Vec<Line> = state
-        .debug_logs
-        .iter()
-        .skip(start)
-        .take(visible)
-        .map(|msg| {
-            // Color-code by prefix
-            let color = if msg.contains("FAILED") || msg.contains("[stderr]") || msg.contains("error") {
-                Color::Red
-            } else if msg.contains("[status:") {
-                Color::Yellow
-            } else if msg.contains("[trigger]") || msg.contains("[plan]") {
-                Color::Green
-            } else if msg.contains("[spawn]") || msg.contains("[worktree]") {
-                Color::Cyan
-            } else if msg.contains("[log:") {
-                Color::DarkGray
-            } else {
-                Color::White
-            };
-            Line::from(Span::styled(msg.clone(), Style::default().fg(color)))
-        })
-        .collect();
+    let page: Vec<Line> = display_lines.into_iter().skip(start).take(visible).collect();
+    f.render_widget(Paragraph::new(page), inner);
+}
 
-    f.render_widget(Paragraph::new(lines), inner);
+fn debug_line_color(msg: &str) -> Color {
+    if msg.contains("FAILED") || msg.contains("[stderr]") || msg.contains("error") {
+        Color::Red
+    } else if msg.contains("[status:") {
+        Color::Yellow
+    } else if msg.contains("[trigger]") || msg.contains("[plan]") {
+        Color::Green
+    } else if msg.contains("[spawn]") || msg.contains("[worktree]") {
+        Color::Cyan
+    } else if msg.contains("[log:") {
+        Color::DarkGray
+    } else {
+        Color::White
+    }
 }
 
 fn status_color(status: &TaskStatus) -> Color {
