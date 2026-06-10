@@ -21,7 +21,9 @@ anyhow           = "1"
 chrono           = { version = "0.4", features = ["serde"] }
 tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-notify           = "6"
+notify               = "6"
+portable-pty         = "0.8"
+strip-ansi-escapes   = "0.2"
 
 [profile.dev]
 opt-level = 1

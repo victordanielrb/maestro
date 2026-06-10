@@ -1,13 +1,11 @@
-use std::process::Stdio;
-use std::sync::Arc;
+use std::io::{BufRead, BufReader as StdBufReader, Write as StdWrite};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Local;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use regex::Regex;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::config::PlanMode;
@@ -53,39 +51,49 @@ pub async fn run(
         }
     }
 
-    send_log(
-        &event_tx,
-        task_id,
-        format!("Worktree created at {}", task.worktree_path.display()),
-    );
+    send_log(&event_tx, task_id, format!("Worktree created at {}", task.worktree_path.display()));
 
-    // ── 2. Build command ──────────────────────────────────────────────────
-    let mut cmd = Command::new(&task.agent.command);
-    cmd.args(&task.agent.args);
+    // ── 2. Open PTY ───────────────────────────────────────────────────────
+    // Claude (and most interactive CLIs) detect they're not on a TTY via
+    // isatty() and disable output buffering / colors / interactivity.
+    // Spawning inside a PTY makes the child believe it has a real terminal.
+    let pty_system = native_pty_system();
+    let pty_pair = match pty_system.openpty(PtySize {
+        rows: 50,
+        cols: 220,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("Failed to open PTY: {e}");
+            debug(&event_tx, format!("[pty] FAILED: {e}"));
+            send_status(&event_tx, task_id, TaskStatus::Failed(msg.clone()));
+            send_log(&event_tx, task_id, msg);
+            let _ = event_tx.send(AppEvent::TaskDone { task_id });
+            return Err(anyhow::anyhow!(e));
+        }
+    };
+
+    // ── 3. Build and spawn command in PTY slave ───────────────────────────
+    let mut cmd_builder = CommandBuilder::new(&task.agent.command);
+    cmd_builder.args(&task.agent.args);
 
     if task.agent.plan_mode == PlanMode::Args {
-        cmd.args(&task.agent.plan_args);
-        cmd.arg(&task.prompt);
+        cmd_builder.args(&task.agent.plan_args);
+        cmd_builder.arg(&task.prompt);
     }
 
-    let full_cmd = format!(
-        "{} {}",
-        task.agent.command,
-        task.agent.args.join(" ")
-    );
-    debug(&event_tx, format!("[spawn] cmd={} cwd={}", full_cmd, task.worktree_path.display()));
+    if let Some(cwd) = task.worktree_path.to_str() {
+        cmd_builder.cwd(cwd);
+    }
 
-    cmd.current_dir(&task.worktree_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Capture stderr — pipe to debug log instead of /dev/null
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    let full_cmd = format!("{} {}", task.agent.command, task.agent.args.join(" "));
+    debug(&event_tx, format!("[spawn] PTY cmd={} cwd={}", full_cmd, task.worktree_path.display()));
 
-    // ── 3. Spawn ──────────────────────────────────────────────────────────
-    let mut child: Child = match cmd.spawn() {
+    let child = match pty_pair.slave.spawn_command(cmd_builder) {
         Ok(c) => {
-            debug(&event_tx, format!("[spawn] OK pid={:?}", c.id()));
+            debug(&event_tx, format!("[spawn] OK pid={:?}", c.process_id()));
             c
         }
         Err(e) => {
@@ -93,48 +101,73 @@ pub async fn run(
             debug(&event_tx, format!("[spawn] FAILED: {e}"));
             send_status(&event_tx, task_id, TaskStatus::Failed(msg.clone()));
             send_log(&event_tx, task_id, msg);
+            drop(pty_pair.slave);
             worktree::remove(&task.worktree_path).await;
             let _ = event_tx.send(AppEvent::TaskDone { task_id });
-            return Err(e.into());
+            return Err(anyhow::anyhow!(e));
         }
     };
 
-    let raw_stdin = child.stdin.take().expect("stdin was piped");
-    let stdout = child.stdout.take().expect("stdout was piped");
-    let stderr_pipe = child.stderr.take().expect("stderr was piped");
+    // Drop slave end in the parent after spawning — important for proper EOF
+    drop(pty_pair.slave);
 
-    let stdin = Arc::new(Mutex::new(BufWriter::new(raw_stdin)));
+    let child = Arc::new(Mutex::new(child));
 
-    // Drain stderr in a background task and send to debug log
-    {
-        let tx = event_tx.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr_pipe).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = tx.send(AppEvent::Debug(format!("[stderr] {}", line)));
-            }
-        });
-    }
+    // ── 4. Get PTY reader/writer ──────────────────────────────────────────
+    let pty_reader = match pty_pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(e) => {
+            debug(&event_tx, format!("[pty] reader failed: {e}"));
+            return Err(anyhow::anyhow!(e));
+        }
+    };
 
-    // ── 4. Send prompt via stdin (Inline / None modes) ────────────────────
+    let pty_writer: Arc<Mutex<Box<dyn StdWrite + Send>>> = Arc::new(Mutex::new(
+        pty_pair.master.take_writer().map_err(|e| anyhow::anyhow!(e))?,
+    ));
+
+    // ── 5. Write prompt to PTY stdin ──────────────────────────────────────
     if task.agent.plan_mode != PlanMode::Args {
         debug(&event_tx, format!("[stdin] writing prompt ({} chars)", task.prompt.len()));
-        let mut guard = stdin.lock().await;
+        let mut w = pty_writer.lock().unwrap();
         if let Some(prefix) = &task.agent.plan_prefix {
             if !prefix.is_empty() {
-                guard.write_all(prefix.as_bytes()).await?;
+                let _ = write!(w, "{}", prefix);
             }
         }
-        guard.write_all(task.prompt.as_bytes()).await?;
-        guard.write_all(b"\n").await?;
-        guard.flush().await?;
+        let _ = writeln!(w, "{}", task.prompt);
+        let _ = w.flush();
         debug(&event_tx, "[stdin] prompt flushed".into());
     }
 
     send_status(&event_tx, task_id, TaskStatus::Running);
-    debug(&event_tx, "[controller] status=Running, reading stdout...".into());
+    debug(&event_tx, "[controller] status=Running, reading PTY stdout...".into());
 
-    // ── 5. Compile plan trigger regex ─────────────────────────────────────
+    // ── 6. Spawn blocking reader → tokio channel ──────────────────────────
+    // PTY reads are blocking; we bridge them to async via a channel.
+    let (line_tx, mut line_rx) = tokio::sync::mpsc::channel::<String>(512);
+    {
+        let tx = line_tx;
+        tokio::task::spawn_blocking(move || {
+            let reader = StdBufReader::new(pty_reader);
+            for line in reader.lines() {
+                match line {
+                    Ok(raw) => {
+                        // Strip ANSI escape codes — PTY gives us colored output
+                        let clean = strip_ansi_escapes::strip_str(&raw);
+                        let clean = clean.trim_end_matches('\r').to_string();
+                        if tx.blocking_send(clean).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // EOF — master closed or child exited
+        });
+    }
+
+    // ── 7. Compile plan trigger regex ─────────────────────────────────────
     let plan_trigger: Option<Regex> = task
         .agent
         .plan_trigger
@@ -143,84 +176,88 @@ pub async fn run(
         .map(|s| Regex::new(s).expect("regex validated at config load"));
 
     if let Some(re) = &plan_trigger {
-        debug(&event_tx, format!("[trigger] watching for regex: {}", re.as_str()));
-    } else {
-        debug(&event_tx, "[trigger] no plan_trigger configured".into());
+        debug(&event_tx, format!("[trigger] watching for: {}", re.as_str()));
     }
 
-    // ── 6. Read stdout line by line ───────────────────────────────────────
     let timeout_enabled = task.agent.input_timeout_secs > 0;
     let timeout_dur = Duration::from_secs(task.agent.input_timeout_secs.max(1) as u64);
-    let mut lines = BufReader::new(stdout).lines();
     let mut line_count: u32 = 0;
 
+    // ── 8. Main read loop ─────────────────────────────────────────────────
     loop {
-        let next_line = lines.next_line();
-
-        let result = if timeout_enabled {
-            match tokio::time::timeout(timeout_dur, next_line).await {
-                Ok(r) => r,
+        // Receive next line, with optional timeout
+        let received = if timeout_enabled {
+            match tokio::time::timeout(timeout_dur, line_rx.recv()).await {
+                Ok(v) => v,
                 Err(_) => {
-                    debug(&event_tx, format!("[stdout] timeout after {}s (no output)", task.agent.input_timeout_secs));
+                    debug(&event_tx, format!("[stdout] timeout after {}s", task.agent.input_timeout_secs));
                     break;
                 }
             }
         } else {
-            next_line.await
+            line_rx.recv().await
         };
 
-        match result {
-            Ok(Some(line)) => {
+        match received {
+            Some(line) => {
                 line_count += 1;
-                if line_count <= 5 || line_count % 50 == 0 {
-                    debug(&event_tx, format!("[stdout:{}] {}", line_count, &line[..line.len().min(80)]));
+                // Log first lines + every 50th to debug without flooding
+                if line_count <= 10 || line_count % 50 == 0 {
+                    debug(&event_tx, format!("[stdout:{}] {}", line_count, &line[..line.len().min(100)]));
                 }
-                send_log(&event_tx, task_id, line.clone());
+
+                // Skip echo of our own writes (PTY echoes stdin back on stdout)
+                // Heuristic: skip very short lines that match what we sent
+                let is_likely_echo = line.trim() == task.agent.plan_accept.trim()
+                    || line.trim() == task.agent.plan_reject.trim();
+                if !is_likely_echo {
+                    send_log(&event_tx, task_id, line.clone());
+                }
 
                 if let Some(re) = &plan_trigger {
                     if re.is_match(&line) {
-                        debug(&event_tx, format!("[trigger] MATCHED on line {}: {:?}", line_count, &line[..line.len().min(60)]));
+                        debug(&event_tx, format!(
+                            "[trigger] MATCHED line {}: {:?}",
+                            line_count,
+                            &line[..line.len().min(80)]
+                        ));
                         send_status(&event_tx, task_id, TaskStatus::WaitingApproval);
 
                         let decision = tokio::time::timeout(
                             Duration::from_secs(600),
                             cmd_rx.recv(),
-                        )
-                        .await;
+                        ).await;
 
                         match decision {
                             Ok(Some(TuiCommand::AcceptPlan)) => {
-                                debug(&event_tx, "[plan] accepted — writing to stdin".into());
-                                let mut guard = stdin.lock().await;
-                                guard.write_all(task.agent.plan_accept.as_bytes()).await?;
-                                guard.write_all(b"\n").await?;
-                                guard.flush().await?;
+                                debug(&event_tx, "[plan] accepted".into());
+                                let mut w = pty_writer.lock().unwrap();
+                                let _ = writeln!(w, "{}", task.agent.plan_accept);
+                                let _ = w.flush();
                                 send_status(&event_tx, task_id, TaskStatus::Executing);
                             }
                             Ok(Some(TuiCommand::RejectPlan)) => {
                                 debug(&event_tx, "[plan] rejected".into());
                                 {
-                                    let mut guard = stdin.lock().await;
-                                    let _ = guard.write_all(task.agent.plan_reject.as_bytes()).await;
-                                    let _ = guard.write_all(b"\n").await;
-                                    let _ = guard.flush().await;
+                                    let mut w = pty_writer.lock().unwrap();
+                                    let _ = writeln!(w, "{}", task.agent.plan_reject);
+                                    let _ = w.flush();
                                 }
-                                let _ = child.kill().await;
+                                kill_child(&child);
                                 send_status(&event_tx, task_id, TaskStatus::Cancelled);
                                 cleanup(&task).await;
                                 let _ = event_tx.send(AppEvent::TaskDone { task_id });
                                 return Ok(());
                             }
                             Ok(Some(TuiCommand::UpdatePrompt(p))) => {
-                                debug(&event_tx, format!("[plan] update prompt: {:?}", &p[..p.len().min(40)]));
-                                let mut guard = stdin.lock().await;
-                                guard.write_all(p.as_bytes()).await?;
-                                guard.write_all(b"\n").await?;
-                                guard.flush().await?;
+                                debug(&event_tx, format!("[plan] update prompt ({} chars)", p.len()));
+                                let mut w = pty_writer.lock().unwrap();
+                                let _ = writeln!(w, "{}", p);
+                                let _ = w.flush();
                             }
                             Ok(Some(TuiCommand::KillTask)) | Ok(None) | Err(_) => {
-                                debug(&event_tx, "[plan] killed/timeout while waiting for approval".into());
-                                let _ = child.kill().await;
+                                debug(&event_tx, "[plan] killed/timed out while waiting".into());
+                                kill_child(&child);
                                 send_status(&event_tx, task_id, TaskStatus::Cancelled);
                                 cleanup(&task).await;
                                 let _ = event_tx.send(AppEvent::TaskDone { task_id });
@@ -230,19 +267,16 @@ pub async fn run(
                     }
                 }
             }
-            Ok(None) => {
+            None => {
                 debug(&event_tx, format!("[stdout] EOF after {} lines", line_count));
-                break;
-            }
-            Err(e) => {
-                debug(&event_tx, format!("[stdout] read error: {e}"));
                 break;
             }
         }
 
+        // Check for kill between lines
         if let Ok(TuiCommand::KillTask) = cmd_rx.try_recv() {
-            debug(&event_tx, "[controller] KillTask received".into());
-            let _ = child.kill().await;
+            debug(&event_tx, "[controller] KillTask".into());
+            kill_child(&child);
             send_status(&event_tx, task_id, TaskStatus::Cancelled);
             cleanup(&task).await;
             let _ = event_tx.send(AppEvent::TaskDone { task_id });
@@ -250,26 +284,38 @@ pub async fn run(
         }
     }
 
-    // ── 7. Wait for exit status ───────────────────────────────────────────
-    match child.wait().await {
-        Ok(status) if status.success() => {
+    // ── 9. Wait for exit ──────────────────────────────────────────────────
+    let child_arc = Arc::clone(&child);
+    let exit_result = tokio::task::spawn_blocking(move || {
+        child_arc.lock().unwrap().wait()
+    }).await;
+
+    match exit_result {
+        Ok(Ok(status)) if status.success() => {
             debug(&event_tx, "[controller] exit OK".into());
             send_status(&event_tx, task_id, TaskStatus::Success);
         }
-        Ok(status) => {
-            let msg = format!("Exit code: {:?}", status.code());
+        Ok(Ok(status)) => {
+            let msg = format!("Exit code: {:?}", status.exit_code());
             debug(&event_tx, format!("[controller] exit FAILED: {msg}"));
             send_status(&event_tx, task_id, TaskStatus::Failed(msg));
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             debug(&event_tx, format!("[controller] wait error: {e}"));
             send_status(&event_tx, task_id, TaskStatus::Failed(e.to_string()));
+        }
+        Err(e) => {
+            debug(&event_tx, format!("[controller] join error: {e}"));
+            send_status(&event_tx, task_id, TaskStatus::Failed("task panic".into()));
         }
     }
 
     if let Some(script) = &task.agent.post_run_script.clone() {
         if !script.is_empty() {
-            run_post_script(script, &task.worktree_path).await;
+            tokio::process::Command::new("sh")
+                .arg("-c").arg(script)
+                .current_dir(&task.worktree_path)
+                .output().await.ok();
         }
     }
 
@@ -293,18 +339,12 @@ fn debug(tx: &AppEventTx, msg: String) {
     let _ = tx.send(AppEvent::Debug(format!("{} {}", ts, msg)));
 }
 
-async fn cleanup(task: &Task) {
-    worktree::remove(&task.worktree_path).await;
+fn kill_child(child: &Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>) {
+    if let Ok(mut c) = child.lock() {
+        let _ = c.kill();
+    }
 }
 
-async fn run_post_script(script: &str, cwd: &std::path::Path) {
-    if let Err(e) = Command::new("sh")
-        .arg("-c")
-        .arg(script)
-        .current_dir(cwd)
-        .output()
-        .await
-    {
-        eprintln!("post_run_script failed: {e}");
-    }
+async fn cleanup(task: &Task) {
+    worktree::remove(&task.worktree_path).await;
 }
