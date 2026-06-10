@@ -21,6 +21,11 @@ pub enum UiAction {
 }
 
 pub fn handle_key(key: KeyEvent, state: &mut AppState) -> UiAction {
+    // ── Debug overlay (highest priority — always closeable) ───────────────
+    if state.show_debug {
+        return handle_debug_overlay(key, state);
+    }
+
     // ── Quit modal ────────────────────────────────────────────────────────
     if state.show_quit_modal {
         return handle_quit_modal(key, state);
@@ -58,8 +63,8 @@ pub fn handle_key(key: KeyEvent, state: &mut AppState) -> UiAction {
             };
             return UiAction::Handled;
         }
-        KeyCode::Char('?') => {
-            // Help overlay — handled by ui.rs toggle
+        KeyCode::Char('?') | KeyCode::Char('L') => {
+            state.toggle_debug();
             return UiAction::Handled;
         }
         _ => {}
@@ -71,6 +76,28 @@ pub fn handle_key(key: KeyEvent, state: &mut AppState) -> UiAction {
         Focus::Chat => handle_chat(key, state),
         Focus::NewTaskForm => UiAction::Ignored,
     }
+}
+
+fn handle_debug_overlay(key: KeyEvent, state: &mut AppState) -> UiAction {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+            state.show_debug = false;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.debug_scroll = state.debug_scroll.saturating_add(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            state.debug_scroll = state.debug_scroll.saturating_sub(1);
+        }
+        KeyCode::Char('g') => {
+            state.debug_scroll = usize::MAX / 2;
+        }
+        KeyCode::Char('G') => {
+            state.debug_scroll = 0;
+        }
+        _ => {}
+    }
+    UiAction::Handled
 }
 
 fn handle_quit_modal(key: KeyEvent, state: &mut AppState) -> UiAction {

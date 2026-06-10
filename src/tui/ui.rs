@@ -30,6 +30,10 @@ pub fn render(f: &mut Frame, state: &mut AppState) {
     render_action_bar(f, state, root[1]);
 
     // Overlays (rendered last so they appear on top)
+    if state.show_debug {
+        render_debug_overlay(f, state, area);
+        return; // debug overlay is full-screen, skip other overlays
+    }
     if state.show_quit_modal {
         render_quit_modal(f, state, area);
     }
@@ -223,8 +227,8 @@ fn build_action_hints(state: &AppState) -> Vec<Span<'static>> {
         Span::raw("  "),
         key("[n]"), label("New task"),
         key("[Tab]"), label("Switch panel"),
+        key("[?]"), label("Debug log"),
         key("[q]"), label("Quit"),
-        key("[?]"), label("Help"),
     ]);
 
     spans
@@ -338,6 +342,60 @@ fn render_new_task_form(f: &mut Frame, state: &AppState, area: Rect) {
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────
+
+// ── Debug Overlay ─────────────────────────────────────────────────────────
+
+fn render_debug_overlay(f: &mut Frame, state: &AppState, area: Rect) {
+    f.render_widget(Clear, area);
+
+    let count = state.debug_logs.len();
+    let title = format!(" Debug Log ({} lines) — [?/q/Esc] close  [j/k] scroll  [g/G] top/bottom ", count);
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let visible = inner.height as usize;
+    let total = count;
+
+    let start = if total > visible {
+        let max_scroll = total - visible;
+        let scroll = state.debug_scroll.min(max_scroll);
+        total - visible - scroll
+    } else {
+        0
+    };
+
+    let lines: Vec<Line> = state
+        .debug_logs
+        .iter()
+        .skip(start)
+        .take(visible)
+        .map(|msg| {
+            // Color-code by prefix
+            let color = if msg.contains("FAILED") || msg.contains("[stderr]") || msg.contains("error") {
+                Color::Red
+            } else if msg.contains("[status:") {
+                Color::Yellow
+            } else if msg.contains("[trigger]") || msg.contains("[plan]") {
+                Color::Green
+            } else if msg.contains("[spawn]") || msg.contains("[worktree]") {
+                Color::Cyan
+            } else if msg.contains("[log:") {
+                Color::DarkGray
+            } else {
+                Color::White
+            };
+            Line::from(Span::styled(msg.clone(), Style::default().fg(color)))
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
 
 fn status_color(status: &TaskStatus) -> Color {
     match status {

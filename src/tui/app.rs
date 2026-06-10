@@ -57,6 +57,10 @@ pub struct AppState {
     pub task_channels: HashMap<Uuid, TuiCommandTx>,
     pub config: Config,
     pub worktree_base: PathBuf,
+    /// Debug/diagnostic log visible via [?]
+    pub debug_logs: Vec<String>,
+    pub show_debug: bool,
+    pub debug_scroll: usize,
 }
 
 impl AppState {
@@ -72,23 +76,27 @@ impl AppState {
             task_channels: HashMap::new(),
             config,
             worktree_base,
+            debug_logs: Vec::new(),
+            show_debug: false,
+            debug_scroll: 0,
         }
     }
 
     pub fn apply_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::LogLine { task_id, line } => {
+                let task_name = self.tasks.iter().find(|t| t.id == task_id)
+                    .map(|t| t.name.clone()).unwrap_or_default();
+                self.push_debug(format!("[log:{}] {}", task_name, &line[..line.len().min(120)]));
                 if let Some(task) = self.find_task_mut(task_id) {
                     task.append_agent_line(&line);
-                    // Auto-scroll only if already at bottom
-                    if self.chat_scroll == 0 {
-                        self.chat_scroll = 0;
-                    }
                 }
             }
             AppEvent::StatusChange { task_id, status } => {
+                let task_name = self.tasks.iter().find(|t| t.id == task_id)
+                    .map(|t| t.name.clone()).unwrap_or_default();
+                self.push_debug(format!("[status:{}] {:?}", task_name, status));
                 if let Some(task) = self.find_task_mut(task_id) {
-                    // Close streaming message when agent pauses/finishes
                     if matches!(
                         status,
                         TaskStatus::WaitingApproval
@@ -102,14 +110,36 @@ impl AppState {
                 }
             }
             AppEvent::Screenshot { task_id, path } => {
+                self.push_debug(format!("[screenshot] {:?}", path));
                 if let Some(task) = self.find_task_mut(task_id) {
                     task.screenshot_path = Some(path);
                 }
             }
             AppEvent::TaskDone { task_id } => {
+                self.push_debug(format!("[done] task_id={}", task_id));
                 self.task_channels.remove(&task_id);
             }
+            AppEvent::Debug(msg) => {
+                self.push_debug(msg);
+            }
         }
+    }
+
+    fn push_debug(&mut self, msg: String) {
+        self.debug_logs.push(msg);
+        // Keep last 2000 lines to avoid unbounded growth
+        if self.debug_logs.len() > 2000 {
+            self.debug_logs.drain(..200);
+        }
+        // Auto-scroll to bottom when not manually scrolled
+        if self.debug_scroll == 0 {
+            self.debug_scroll = 0;
+        }
+    }
+
+    pub fn toggle_debug(&mut self) {
+        self.show_debug = !self.show_debug;
+        self.debug_scroll = 0; // jump to bottom on open
     }
 
     pub fn route_command(&mut self, cmd: TuiCommand) {

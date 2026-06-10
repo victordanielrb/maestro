@@ -1,14 +1,13 @@
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::process::Stdio;
-
 use anyhow::Result;
+use chrono::Local;
 use regex::Regex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::config::PlanMode;
@@ -23,16 +22,35 @@ pub async fn run(
 ) -> Result<()> {
     let task_id = task.id;
 
+    debug(&event_tx, format!(
+        "[controller] started task={} agent={} mode={:?} cwd={}",
+        task.name, task.agent.command, task.agent.plan_mode, task.worktree_path.display()
+    ));
+
     // ── 1. Create worktree ────────────────────────────────────────────────
     send_status(&event_tx, task_id, TaskStatus::CreatingWorktree);
     let branch = format!("agent/{}-{}", task.name, &task_id.to_string()[..8]);
 
-    if let Err(e) = worktree::add(&branch, &task.worktree_path).await {
-        let msg = format!("Failed to create worktree: {e}");
-        send_status(&event_tx, task_id, TaskStatus::Failed(msg.clone()));
-        send_log(&event_tx, task_id, msg);
-        let _ = event_tx.send(AppEvent::TaskDone { task_id });
-        return Err(e);
+    debug(&event_tx, format!("[worktree] git worktree add -b {} {}", branch, task.worktree_path.display()));
+
+    match worktree::add_verbose(&branch, &task.worktree_path).await {
+        Ok((stdout, stderr)) => {
+            if !stdout.trim().is_empty() {
+                debug(&event_tx, format!("[worktree stdout] {}", stdout.trim()));
+            }
+            if !stderr.trim().is_empty() {
+                debug(&event_tx, format!("[worktree stderr] {}", stderr.trim()));
+            }
+            debug(&event_tx, "[worktree] created OK".into());
+        }
+        Err(e) => {
+            let msg = format!("Failed to create worktree: {e}");
+            debug(&event_tx, format!("[worktree] FAILED: {e}"));
+            send_status(&event_tx, task_id, TaskStatus::Failed(msg.clone()));
+            send_log(&event_tx, task_id, msg);
+            let _ = event_tx.send(AppEvent::TaskDone { task_id });
+            return Err(e);
+        }
     }
 
     send_log(
@@ -47,22 +65,32 @@ pub async fn run(
 
     if task.agent.plan_mode == PlanMode::Args {
         cmd.args(&task.agent.plan_args);
-        // Prompt as final positional argument
         cmd.arg(&task.prompt);
     }
+
+    let full_cmd = format!(
+        "{} {}",
+        task.agent.command,
+        task.agent.args.join(" ")
+    );
+    debug(&event_tx, format!("[spawn] cmd={} cwd={}", full_cmd, task.worktree_path.display()));
 
     cmd.current_dir(&task.worktree_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        // Redirect stderr to null — inherited stderr would corrupt the TUI
-        .stderr(Stdio::null())
+        // Capture stderr — pipe to debug log instead of /dev/null
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
 
     // ── 3. Spawn ──────────────────────────────────────────────────────────
     let mut child: Child = match cmd.spawn() {
-        Ok(c) => c,
+        Ok(c) => {
+            debug(&event_tx, format!("[spawn] OK pid={:?}", c.id()));
+            c
+        }
         Err(e) => {
             let msg = format!("Failed to spawn '{}': {e}", task.agent.command);
+            debug(&event_tx, format!("[spawn] FAILED: {e}"));
             send_status(&event_tx, task_id, TaskStatus::Failed(msg.clone()));
             send_log(&event_tx, task_id, msg);
             worktree::remove(&task.worktree_path).await;
@@ -73,11 +101,24 @@ pub async fn run(
 
     let raw_stdin = child.stdin.take().expect("stdin was piped");
     let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr_pipe = child.stderr.take().expect("stderr was piped");
 
     let stdin = Arc::new(Mutex::new(BufWriter::new(raw_stdin)));
 
+    // Drain stderr in a background task and send to debug log
+    {
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr_pipe).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let _ = tx.send(AppEvent::Debug(format!("[stderr] {}", line)));
+            }
+        });
+    }
+
     // ── 4. Send prompt via stdin (Inline / None modes) ────────────────────
     if task.agent.plan_mode != PlanMode::Args {
+        debug(&event_tx, format!("[stdin] writing prompt ({} chars)", task.prompt.len()));
         let mut guard = stdin.lock().await;
         if let Some(prefix) = &task.agent.plan_prefix {
             if !prefix.is_empty() {
@@ -87,10 +128,11 @@ pub async fn run(
         guard.write_all(task.prompt.as_bytes()).await?;
         guard.write_all(b"\n").await?;
         guard.flush().await?;
+        debug(&event_tx, "[stdin] prompt flushed".into());
     }
 
     send_status(&event_tx, task_id, TaskStatus::Running);
-    info!(task_id = %task_id, agent = %task.agent.name, "Task running");
+    debug(&event_tx, "[controller] status=Running, reading stdout...".into());
 
     // ── 5. Compile plan trigger regex ─────────────────────────────────────
     let plan_trigger: Option<Regex> = task
@@ -100,10 +142,17 @@ pub async fn run(
         .filter(|s| !s.is_empty())
         .map(|s| Regex::new(s).expect("regex validated at config load"));
 
+    if let Some(re) = &plan_trigger {
+        debug(&event_tx, format!("[trigger] watching for regex: {}", re.as_str()));
+    } else {
+        debug(&event_tx, "[trigger] no plan_trigger configured".into());
+    }
+
     // ── 6. Read stdout line by line ───────────────────────────────────────
     let timeout_enabled = task.agent.input_timeout_secs > 0;
     let timeout_dur = Duration::from_secs(task.agent.input_timeout_secs.max(1) as u64);
     let mut lines = BufReader::new(stdout).lines();
+    let mut line_count: u32 = 0;
 
     loop {
         let next_line = lines.next_line();
@@ -112,7 +161,7 @@ pub async fn run(
             match tokio::time::timeout(timeout_dur, next_line).await {
                 Ok(r) => r,
                 Err(_) => {
-                    warn!(task_id = %task_id, "stdout timeout after {}s", task.agent.input_timeout_secs);
+                    debug(&event_tx, format!("[stdout] timeout after {}s (no output)", task.agent.input_timeout_secs));
                     break;
                 }
             }
@@ -122,14 +171,17 @@ pub async fn run(
 
         match result {
             Ok(Some(line)) => {
+                line_count += 1;
+                if line_count <= 5 || line_count % 50 == 0 {
+                    debug(&event_tx, format!("[stdout:{}] {}", line_count, &line[..line.len().min(80)]));
+                }
                 send_log(&event_tx, task_id, line.clone());
 
                 if let Some(re) = &plan_trigger {
                     if re.is_match(&line) {
-                        info!(task_id = %task_id, "Plan trigger matched, waiting for approval");
+                        debug(&event_tx, format!("[trigger] MATCHED on line {}: {:?}", line_count, &line[..line.len().min(60)]));
                         send_status(&event_tx, task_id, TaskStatus::WaitingApproval);
 
-                        // Wait up to 10 minutes for user decision
                         let decision = tokio::time::timeout(
                             Duration::from_secs(600),
                             cmd_rx.recv(),
@@ -138,20 +190,18 @@ pub async fn run(
 
                         match decision {
                             Ok(Some(TuiCommand::AcceptPlan)) => {
+                                debug(&event_tx, "[plan] accepted — writing to stdin".into());
                                 let mut guard = stdin.lock().await;
-                                guard
-                                    .write_all(task.agent.plan_accept.as_bytes())
-                                    .await?;
+                                guard.write_all(task.agent.plan_accept.as_bytes()).await?;
                                 guard.write_all(b"\n").await?;
                                 guard.flush().await?;
                                 send_status(&event_tx, task_id, TaskStatus::Executing);
                             }
                             Ok(Some(TuiCommand::RejectPlan)) => {
+                                debug(&event_tx, "[plan] rejected".into());
                                 {
                                     let mut guard = stdin.lock().await;
-                                    let _ = guard
-                                        .write_all(task.agent.plan_reject.as_bytes())
-                                        .await;
+                                    let _ = guard.write_all(task.agent.plan_reject.as_bytes()).await;
                                     let _ = guard.write_all(b"\n").await;
                                     let _ = guard.flush().await;
                                 }
@@ -162,15 +212,14 @@ pub async fn run(
                                 return Ok(());
                             }
                             Ok(Some(TuiCommand::UpdatePrompt(p))) => {
+                                debug(&event_tx, format!("[plan] update prompt: {:?}", &p[..p.len().min(40)]));
                                 let mut guard = stdin.lock().await;
                                 guard.write_all(p.as_bytes()).await?;
                                 guard.write_all(b"\n").await?;
                                 guard.flush().await?;
-                                // Resume reading — don't change status
                             }
-                            Ok(Some(TuiCommand::KillTask))
-                            | Ok(None)
-                            | Err(_) => {
+                            Ok(Some(TuiCommand::KillTask)) | Ok(None) | Err(_) => {
+                                debug(&event_tx, "[plan] killed/timeout while waiting for approval".into());
                                 let _ = child.kill().await;
                                 send_status(&event_tx, task_id, TaskStatus::Cancelled);
                                 cleanup(&task).await;
@@ -182,17 +231,17 @@ pub async fn run(
                 }
             }
             Ok(None) => {
-                // EOF — process exited normally
+                debug(&event_tx, format!("[stdout] EOF after {} lines", line_count));
                 break;
             }
             Err(e) => {
-                warn!(task_id = %task_id, "stdout read error: {e}");
+                debug(&event_tx, format!("[stdout] read error: {e}"));
                 break;
             }
         }
 
-        // Drain any pending kill commands between lines
         if let Ok(TuiCommand::KillTask) = cmd_rx.try_recv() {
+            debug(&event_tx, "[controller] KillTask received".into());
             let _ = child.kill().await;
             send_status(&event_tx, task_id, TaskStatus::Cancelled);
             cleanup(&task).await;
@@ -204,19 +253,20 @@ pub async fn run(
     // ── 7. Wait for exit status ───────────────────────────────────────────
     match child.wait().await {
         Ok(status) if status.success() => {
+            debug(&event_tx, "[controller] exit OK".into());
             send_status(&event_tx, task_id, TaskStatus::Success);
-            info!(task_id = %task_id, "Task succeeded");
         }
         Ok(status) => {
             let msg = format!("Exit code: {:?}", status.code());
+            debug(&event_tx, format!("[controller] exit FAILED: {msg}"));
             send_status(&event_tx, task_id, TaskStatus::Failed(msg));
         }
         Err(e) => {
+            debug(&event_tx, format!("[controller] wait error: {e}"));
             send_status(&event_tx, task_id, TaskStatus::Failed(e.to_string()));
         }
     }
 
-    // ── 8. Post-run script (optional) ─────────────────────────────────────
     if let Some(script) = &task.agent.post_run_script.clone() {
         if !script.is_empty() {
             run_post_script(script, &task.worktree_path).await;
@@ -238,19 +288,23 @@ fn send_log(tx: &AppEventTx, task_id: Uuid, line: String) {
     let _ = tx.send(AppEvent::LogLine { task_id, line });
 }
 
+fn debug(tx: &AppEventTx, msg: String) {
+    let ts = Local::now().format("%H:%M:%S%.3f");
+    let _ = tx.send(AppEvent::Debug(format!("{} {}", ts, msg)));
+}
+
 async fn cleanup(task: &Task) {
     worktree::remove(&task.worktree_path).await;
 }
 
 async fn run_post_script(script: &str, cwd: &std::path::Path) {
-    let result = Command::new("sh")
+    if let Err(e) = Command::new("sh")
         .arg("-c")
         .arg(script)
         .current_dir(cwd)
         .output()
-        .await;
-
-    if let Err(e) = result {
-        warn!("post_run_script failed: {e}");
+        .await
+    {
+        eprintln!("post_run_script failed: {e}");
     }
 }

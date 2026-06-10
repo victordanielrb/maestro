@@ -31,4 +31,6 @@ pub enum AppEvent {
     StatusChange { task_id: Uuid, status: TaskStatus },
     Screenshot { task_id: Uuid, path: PathBuf },
     TaskDone { task_id: Uuid },
+    /// Internal debug/diagnostic message shown in the debug overlay ([?])
+    Debug(String),
 }

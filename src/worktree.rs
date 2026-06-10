@@ -3,18 +3,28 @@ use std::path::Path;
 use tokio::process::Command;
 
 pub async fn add(branch: &str, path: &Path) -> Result<()> {
+    add_verbose(branch, path).await.map(|_| ())
+}
+
+/// Like `add`, but returns (stdout, stderr) for debug logging.
+pub async fn add_verbose(branch: &str, path: &Path) -> Result<(String, String)> {
     let output = Command::new("git")
         .args(["worktree", "add", "-b", branch, path.to_str().unwrap_or(".")])
         .output()
         .await?;
 
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
     if !output.status.success() {
         bail!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "exit={} stderr={} stdout={}",
+            output.status,
+            stderr.trim(),
+            stdout.trim()
         );
     }
-    Ok(())
+    Ok((stdout, stderr))
 }
 
 pub async fn remove(path: &Path) {
